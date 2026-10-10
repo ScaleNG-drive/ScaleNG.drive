@@ -10862,22 +10862,48 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
                 Log("hooks: device CreateCommandList hook create FAILED target=%p st=%d",
                     ccl, (int)lst);
             }
-            // Observation-only: hook CreateCommandList1 (ID3D12Device4, slot 51)
-            // to census which creation path the game uses. Forwards to real only;
-            // does NOT install command-list shims. Same-vtable guard as Device4
-            // hooks at 10630: only instrument if the Device4 vtable is shared.
-            void* cc1Target = dv[51];
-            if (cc1Target && InterlockedCompareExchange(&g_diagCC1Installed, 0, 0) == 0) {
-                MH_STATUS cc1st = MH_CreateHook(cc1Target, (void*)&Hook_CreateCommandList1_Diag,
-                                                (void**)&Real_CreateCommandList1);
-                if (cc1st == MH_OK || cc1st == MH_ERROR_ALREADY_CREATED) {
-                    MH_STATUS cc1en = MH_EnableHook(cc1Target);
-                    Log("hooks: CreateCommandList1 diag hook INSTALLED slot=51 target=%p st=%d enable=%d",
-                        (void*)cc1Target, (int)cc1st, (int)cc1en);
-                    InterlockedExchange(&g_diagCC1Installed, 1);
+            // Observation-only: census CreateCommandList1 creation path.
+            // SAFE VERIFICATION: QueryInterface for ID3D12Device4 before
+            // touching slot 51 — the base ID3D12Device vtable may not extend
+            // to Device4 methods. Does NOT call InstallCommandListHooks,
+            // does NOT write to any list vtable.
+            {
+                ID3D12Device4* dev4 = nullptr;
+                HRESULT q4hr = newDev->QueryInterface(__uuidof(ID3D12Device4),
+                                                      (void**)&dev4);
+                if (SUCCEEDED(q4hr) && dev4) {
+                    dev4->Release();
+                    void* cc1Target = dv[51];
+                    if (cc1Target &&
+                        InterlockedCompareExchange(&g_diagCC1Installed, 0, 0) == 0) {
+                        MH_STATUS cc1st = MH_CreateHook(cc1Target,
+                            (void*)&Hook_CreateCommandList1_Diag,
+                            (void**)&Real_CreateCommandList1);
+                        if (cc1st == MH_OK || cc1st == MH_ERROR_ALREADY_CREATED) {
+                            MH_STATUS cc1en = MH_EnableHook(cc1Target);
+                            // Report install status accurately: only set the
+                            // one-shot flag if EnableHook succeeded.
+                            if (cc1en == MH_OK) {
+                                Log("hooks: CreateCommandList1 diag INSTALLED slot=51 target=%p st=%d enable=%d",
+                                    (void*)cc1Target, (int)cc1st, (int)cc1en);
+                                InterlockedExchange(&g_diagCC1Installed, 1);
+                            } else {
+                                Log("hooks: CreateCommandList1 diag ENABLE FAILED slot=51 target=%p st=%d enable=%d",
+                                    (void*)cc1Target, (int)cc1st, (int)cc1en);
+                            }
+                        } else {
+                            Log("hooks: CreateCommandList1 diag CREATE FAILED slot=51 target=%p st=%d",
+                                (void*)cc1Target, (int)cc1st);
+                        }
+                    }
                 } else {
-                    Log("hooks: CreateCommandList1 diag hook FAILED slot=51 target=%p st=%d",
-                        (void*)cc1Target, (int)cc1st);
+                    // One-shot diagnostic: device lacks Device4 support.
+                    static volatile LONG s_cc1NoDevice4Logged = 0;
+                    LONG nl = InterlockedIncrement(&s_cc1NoDevice4Logged);
+                    if (nl <= 3) {
+                        Log("hooks: CreateCommandList1 diag SKIPPED (device lacks ID3D12Device4, hr=0x%08X)",
+                            (unsigned)q4hr);
+                    }
                 }
             }
         }

@@ -232,27 +232,38 @@ Modify `WasListHooked` (line 1643-1653) to read the current vtable from the list
 - Reviewer 3 (CreateCommandList1 slot verification): VERIFIED slot 51 against
   SDK 10.0.28000.0 header (d3d12.h line 13031); confirmed CreateCommandList1
   is on ID3D12Device4 (not ID3D12Device1); confirmed game QI's to Device4.
+- Reviewer 4 (final diff safety): VERIFIED all 7 criteria — ABI, concurrency,
+  log-volume, no-vtable-writes, no-alloc, gates-preserved, code-quality.
 - Compiler note: variable names with trailing digits (lst1, ccl1) triggered C2059;
   renaming to cc1st/cc1Target resolved the build.
 
-### What the instrumentation will tell us
-- **Part A:** Whether the engine calls `CreateCommandList1` at all. Log shows
-  `#N` count and list pointer/vtable for first 8 + every 200th call.
-  If 0 calls → problem is vtable restoration, not creation path.
-  If >0 calls → lists from this path lack creation-time hooks.
+### Reviewer 4 post-fix resolution
+- **Device4 QI guard (was caveat 7b):** RESOLVED. `QueryInterface(__uuidof(ID3D12Device4))`
+  added before slot 51 access; hook install SKIPPED if Device4 absent.
+- **Accurate install status:** RESOLVED. `g_diagCC1Installed` set only on
+  `MH_EnableHook == MH_OK`; enable-create mismatch logged explicitly.
+- **STATUS.md causality:** RESOLVED. Conclusions now distinguish observed
+  pointer equality from causation; zero calls ≠ proof of restoration cause.
 
-- **Part B:** Classification of all 113,967 shim-miss submissions.
-  If all `original-restored` → runtime state-vtable swap (safe to re-point later).
-  If any `foreign-vtable` → third-party hook detected (must not overwrite).
+### What the instrumentation will tell us
+- **Part A:** Whether the engine calls `CreateCommandList1` at all during the run.
+  Log shows `#N` count and list pointer/vtable for first 8 + every 200th call.
+  Zero observed calls means only that no calls were observed **in this run** —
+  it does not prove that vtable restoration is the cause or rule out other
+  paths.
+- **Part B:** Classification of all shim-miss submissions (113,967+ from
+  prior run). Categorizes observed state: `clone-active`/`original-restored`/
+  `foreign-vtable`. Note the distinction is about vtable pointer equality,
+  not causation.
 
 ### What the instrumentation cannot establish
-- Slot 51 correctness at RUNTIME: relies on `dv[51]` being non-null and a
-  valid function address. If the game never QI's to Device4, slot 51 may be
-  invalid — MinHook would fail and log the failure (non-fatal).
-- Vtable change timing: between reading and logging, the runtime could
-  swap again. The log captures a single observation point.
-- Causal link: logs show correlation (list X lost vtable at submission Y),
-  not causation (which runtime operation caused the swap).
+- **Causality:** `original-restored` establishes pointer equality with the
+  recorded original vtable only. It does not explain *why* the change happened
+  or prove that replacing the vtable would be safe in all cases.
+- **Creation path exclusivity:** Zero `CreateCommandList1` calls observed in
+  one run does not rule out that path being used in another configuration.
+- Slot 51 runtime validity: relies on the Device4 QI check + MinHook
+  install success/failure log (non-fatal; skips cleanly if Device4 absent).
 
 ### Proposed single controlled test
 One 40–75 s BeamNG session (`-level GridMap -vehicle pickup -console -gfx d3d12`):
