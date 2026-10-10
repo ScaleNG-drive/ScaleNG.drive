@@ -4390,6 +4390,34 @@ bool g_inInject = false;
 
 void EnsureGlobalSwapchainHookImpl();
 
+// Observation-only command-list vtable-stability tracker (diagnostic).
+// Fixed capacity, no allocation on the observation path, no new locks:
+// updates run under the existing g_commandListShimLock (exclusive),
+// sequential with the table scans above and never nested inside another
+// acquisition. For each submitted list pointer it records the last seen
+// actual vtable so a later different address is detectable as a change.
+// A same-pointer/different-vtable event is consistent with a rewrite OR
+// with object-address reuse after destroy/recreate; only stability (same
+// vtable across many observations) unambiguously shows no rewrite.
+// No eviction: once full, further distinct pointers are counted as
+// overflow (reported) and never silently merged into other entries.
+struct VtblStabilityEntry {
+    void* list;
+    void* lastVtbl;
+    UINT listType;
+    LONG64 observations;
+    LONG64 changes;
+    unsigned long long firstPresent;
+    unsigned long long lastPresent;
+    char lastClass; // 'C' clone-active, 'O' original-restored, 'F' foreign
+};
+static VtblStabilityEntry s_vtblStab[64] = {};
+static LONG64 s_vtblStabDistinct = 0;
+static LONG64 s_vtblStabOverflow = 0;
+static LONG64 s_vtblStabSkipped = 0;
+static volatile LONG s_vtblStabInitLogs = 0;
+static volatile LONG s_vtblStabChangeLogs = 0;
+
 void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
                               ID3D12CommandList* const* lists)
 {
@@ -4514,6 +4542,96 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
                                 (void*)cl, vtblClass, actual, expectedCloned, expectedOriginal, vc);
                         }
                     }
+                    // Observation-only vtable-stability tracking: record this
+                    // list's actual vtable to detect later changes. Reuses the
+                    // classification above; no extra vtable reads, no GetDesc,
+                    // no resource dereference, no behavior change. The table
+                    // update runs under the existing shim-table lock (exclusive,
+                    // bounded fixed-capacity scan, no nested acquisition); all
+                    // Log calls below run after lock release from local copies.
+                    // Init records: first 8. Changes: every detected change up
+                    // to a bounded budget (counted beyond it, never sampled
+                    // away within budget). Routine repeats: counted silently,
+                    // summarized on the existing sampled cadence below.
+                    void* stabVtbl = nullptr;
+                    const char* stabClass = "?";
+                    bool stabClassifiable = false;
+                    if (preShim) {
+                        stabVtbl = preShim->clonedVtbl;
+                        stabClass = "C";
+                        stabClassifiable = true;
+                    } else if (ptrRegistered) {
+                        stabVtbl = actual;
+                        stabClass = (actual == expectedCloned) ? "C" :
+                            ((actual == expectedOriginal) ? "O" : "F");
+                        stabClassifiable = true;
+                    }
+                    bool stabIsNew = false, stabChanged = false;
+                    void* stabPrev = nullptr;
+                    const char* stabPrevClass = "?";
+                    unsigned long long stabObs = 0, stabChg = 0;
+                    unsigned long long stabPresent =
+                        (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0);
+                    unsigned long long stabEcl =
+                        (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0);
+                    if (stabClassifiable && stabVtbl) {
+                        AcquireSRWLockExclusive(&g_commandListShimLock);
+                        VtblStabilityEntry* stabSlot = nullptr;
+                        for (auto& e : s_vtblStab) {
+                            if (e.list == (void*)cl) { stabSlot = &e; break; }
+                        }
+                        if (!stabSlot) {
+                            for (auto& e : s_vtblStab) {
+                                if (!e.list) { stabSlot = &e; break; }
+                            }
+                            if (stabSlot) {
+                                stabSlot->list = (void*)cl;
+                                stabSlot->lastVtbl = stabVtbl;
+                                stabSlot->listType = clType;
+                                stabSlot->observations = 1;
+                                stabSlot->changes = 0;
+                                stabSlot->firstPresent = stabPresent;
+                                stabSlot->lastPresent = stabPresent;
+                                stabSlot->lastClass = stabClass[0];
+                                s_vtblStabDistinct++;
+                                stabIsNew = true;
+                                stabObs = 1;
+                            } else {
+                                s_vtblStabOverflow++;
+                            }
+                        } else {
+                            stabSlot->observations++;
+                            stabSlot->lastPresent = stabPresent;
+                            if (stabSlot->lastVtbl != stabVtbl) {
+                                stabChanged = true;
+                                stabPrev = stabSlot->lastVtbl;
+                                stabPrevClass = (stabSlot->lastClass == 'C') ? "C" :
+                                    ((stabSlot->lastClass == 'O') ? "O" : "F");
+                                stabSlot->lastVtbl = stabVtbl;
+                                stabSlot->changes++;
+                            }
+                            stabSlot->lastClass = stabClass[0];
+                        }
+                        if (stabSlot) {
+                            stabObs = (unsigned long long)stabSlot->observations;
+                            stabChg = (unsigned long long)stabSlot->changes;
+                        }
+                        ReleaseSRWLockExclusive(&g_commandListShimLock);
+                    } else {
+                        InterlockedIncrement64(&s_vtblStabSkipped);
+                    }
+                    if (stabIsNew && InterlockedIncrement(&s_vtblStabInitLogs) <= 8) {
+                        Log("hooks: vtbl-stab init list=%p vtbl=%p class=%s type=%u present=%llu ecl=%llu",
+                            (void*)cl, stabVtbl, stabClass, clType, stabPresent, stabEcl);
+                    }
+                    if (stabChanged) {
+                        LONG stabChangeN = InterlockedIncrement(&s_vtblStabChangeLogs);
+                        if (stabChangeN <= 40) {
+                            Log("hooks: vtbl-stab change list=%p prevVtbl=%p newVtbl=%p prevClass=%s newClass=%s obs=%llu changes=%llu present=%llu ecl=%llu",
+                                (void*)cl, stabPrev, stabVtbl, stabPrevClass, stabClass,
+                                stabObs, stabChg, stabPresent, stabEcl);
+                        }
+                    }
                     if (sampled) {
                         LONG64 hits = InterlockedCompareExchange64(&s_eclHitTotal, 0, 0);
                         LONG64 misses = InterlockedCompareExchange64(&s_eclMissTotal, 0, 0);
@@ -4537,6 +4655,12 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
                             (long long)InterlockedCompareExchange64(&g_mvRecordingCloseSuccessTotal, 0, 0),
                             (long long)InterlockedCompareExchange64(&g_mvRecordingCloseFailTotal, 0, 0),
                             (long long)InterlockedCompareExchange64(&g_mvRecordingCloneMismatchTotal, 0, 0));
+                        Log("hooks: vtbl-stab summary tracked=%lld overflow=%lld skipped=%lld initLogs=%ld changeLogs=%ld",
+                            (long long)InterlockedCompareExchange64(&s_vtblStabDistinct, 0, 0),
+                            (long long)InterlockedCompareExchange64(&s_vtblStabOverflow, 0, 0),
+                            (long long)InterlockedCompareExchange64(&s_vtblStabSkipped, 0, 0),
+                            InterlockedCompareExchange(&s_vtblStabInitLogs, 0, 0),
+                            InterlockedCompareExchange(&s_vtblStabChangeLogs, 0, 0));
                     }
                     // Integrity detail only on sampled misses whose pointer is
                     // registered: snapshot states whether our clone is intact,
