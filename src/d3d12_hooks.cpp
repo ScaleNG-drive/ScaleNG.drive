@@ -8409,6 +8409,30 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
         if (depthTouchDiagMatch && (LONG64)presentSerial >= depthTouchDiag.present)
             depthTouchDiagAge = presentSerial - (unsigned long long)depthTouchDiag.present;
         bool depAlive = depthGenerationCurrent && dep && SafeGetDesc(dep, &depd);
+        // Observation-only diagnostic: depAlive is computed above but never
+        // logged. This bounded snapshot records whether depth would
+        // independently pass the line-8422 gate (if reached) when MV is dead.
+        // Does NOT modify realWhy, useReal, cascade logic, vtables, or hooks.
+        // depd is zero-initialized at declaration (line 8369); SafeGetDesc
+        // only writes it on success, so depd fields are safe to read when
+        // depAlive is true and are reported as 0 when false.
+        if (!mvAlive && dep) {
+            static volatile LONG s_depthDescDiag = 0;
+            if (InterlockedIncrement(&s_depthDescDiag) <= 8 ||
+                (s_depthDescDiag % 600) == 0) {
+                Log("hooks: depth-desc diag present=%llu depCand=%p depthGen=%lld "
+                    "depthGenCurrent=%d depAlive=%d "
+                    "depdW=%u depdH=%u depdFmt=%u depdSamples=%u",
+                    (unsigned long long)presentSerial, (void*)depCand,
+                    (long long)depthGeneration,
+                    depthGenerationCurrent ? 1 : 0,
+                    depAlive ? 1 : 0,
+                    depAlive ? (unsigned)depd.Width : 0u,
+                    depAlive ? (unsigned)depd.Height : 0u,
+                    depAlive ? (unsigned)depd.Format : 0u,
+                    depAlive ? (unsigned)depd.SampleDesc.Count : 0u);
+            }
+        }
         if (InterlockedCompareExchange(&g_resourceAddressGenerationOverflow, 0, 0))
             realWhy = "resource-generation-overflow";
         else if (!g_mvValid || !mv) realWhy = "no-mv";
