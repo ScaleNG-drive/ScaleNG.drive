@@ -10864,16 +10864,23 @@ HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minLe
             }
             // Observation-only: census CreateCommandList1 creation path.
             // SAFE VERIFICATION: QueryInterface for ID3D12Device4 before
-            // touching slot 51 — the base ID3D12Device vtable may not extend
-            // to Device4 methods. Does NOT call InstallCommandListHooks,
-            // does NOT write to any list vtable.
+            // touching slot 51 — the base ID3D12Device vtable may not
+            // extend to Device4 methods. Slot 51 is read from the Device4
+            // vtable obtained via QI, not from the base Device vtable.
+            // Does NOT call InstallCommandListHooks, does NOT write to any
+            // list vtable.
             {
                 ID3D12Device4* dev4 = nullptr;
                 HRESULT q4hr = newDev->QueryInterface(__uuidof(ID3D12Device4),
                                                       (void**)&dev4);
                 if (SUCCEEDED(q4hr) && dev4) {
+                    // Read slot 51 from the Device4 interface vtable that
+                    // actually defines CreateCommandList1. Keep dev4 alive
+                    // while obtaining the target, release after.
+                    void** dev4Vtbl = nullptr;
+                    __try { dev4Vtbl = *(void***)dev4; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    void* cc1Target = dev4Vtbl ? dev4Vtbl[51] : nullptr;
                     dev4->Release();
-                    void* cc1Target = dv[51];
                     if (cc1Target &&
                         InterlockedCompareExchange(&g_diagCC1Installed, 0, 0) == 0) {
                         MH_STATUS cc1st = MH_CreateHook(cc1Target,

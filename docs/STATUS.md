@@ -240,6 +240,10 @@ Modify `WasListHooked` (line 1643-1653) to read the current vtable from the list
 ### Reviewer 4 post-fix resolution
 - **Device4 QI guard (was caveat 7b):** RESOLVED. `QueryInterface(__uuidof(ID3D12Device4))`
   added before slot 51 access; hook install SKIPPED if Device4 absent.
+- **Slot 51 source (follow-up review of `fc99c66`):** RESOLVED. Slot 51 now read
+  from the Device4 interface vtable (`dev4Vtbl[51]`), not from the base
+  `ID3D12Device` vtable (`dv[51]`). `dev4` kept alive during vtable read,
+  `Release()` called after target pointer obtained.
 - **Accurate install status:** RESOLVED. `g_diagCC1Installed` set only on
   `MH_EnableHook == MH_OK`; enable-create mismatch logged explicitly.
 - **STATUS.md causality:** RESOLVED. Conclusions now distinguish observed
