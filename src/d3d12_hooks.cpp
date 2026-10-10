@@ -8386,6 +8386,45 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
             mvGenerationCurrent = true;
             mvAlive = true;
         }
+        // Observation-only diagnostic: distinguishes which MV validity
+        // conjunct fails when the line-8440 gate reports "mv-retired".
+        // Reuses already-computed intermediates; makes NO additional GetDesc
+        // calls and never dereferences a resource whose lookup failed.
+        // mvd fields are only read when mvAlive is true (else reported 0).
+        // GetResourceAddressGeneration takes only a shared table lock and
+        // does not dereference the resource. Does NOT modify realWhy,
+        // useReal, cascade logic, vtables, hooks, counters, or tracking.
+        // Bounded: first 8 records, then every 600th eligible record.
+        {
+            static volatile LONG s_mvDescDiag = 0;
+            if (InterlockedIncrement(&s_mvDescDiag) <= 8 ||
+                (s_mvDescDiag % 600) == 0) {
+                LONG64 mvGenLookup = GetResourceAddressGeneration(mv);
+                bool mvAltRescued = considerMvAlt && mvAltDiag &&
+                    mvAltGenerationCurrent && mvAltDescRead;
+                Log("hooks: mv-desc diag present=%llu gmvValid=%d mvPrimNull=%d mvSelNull=%d "
+                    "mvGenStored=%lld mvGenLookup=%lld mvGenCurrent=%d mvAlive=%d "
+                    "mvdFmt=%u mvdW=%u mvdH=%u "
+                    "altPresent=%d altGen=%lld altGenCurrent=%d altDescRead=%d altRescued=%d considerAlt=%d",
+                    (unsigned long long)presentSerial,
+                    g_mvValid ? 1 : 0,
+                    g_mvResource ? 0 : 1,
+                    mv ? 0 : 1,
+                    (long long)mvGeneration,
+                    (long long)mvGenLookup,
+                    mvGenerationCurrent ? 1 : 0,
+                    mvAlive ? 1 : 0,
+                    mvAlive ? (unsigned)mvd.Format : 0u,
+                    mvAlive ? (unsigned)mvd.Width : 0u,
+                    mvAlive ? (unsigned)mvd.Height : 0u,
+                    mvAltDiag ? 1 : 0,
+                    (long long)mvAltGenerationDiag,
+                    mvAltGenerationCurrent ? 1 : 0,
+                    mvAltDescRead ? 1 : 0,
+                    mvAltRescued ? 1 : 0,
+                    considerMvAlt ? 1 : 0);
+            }
+        }
         mvCand = mv; depCand = dep;
         if (mv == g_mvResource) {
             mvTouchDiagSlot = "primary";
