@@ -3898,6 +3898,13 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
     // chicken-and-egg deadlock (need discovery to build bridge, need bridge
     // to enable discovery).
     // Track RTVs on ALL game devices - the game creates multiple devices.
+    // Observation-only census snapshots (see end-of-body rtv-census block):
+    // slot pointers and stored generations BEFORE the adoption chain below
+    // may mutate them. Plain reads only; no behavior change.
+    ID3D12Resource* rtvCensusMvPre = g_mvResource;
+    ID3D12Resource* rtvCensusAltPre = g_mvResourceAlt;
+    LONG64 rtvCensusMvGenPre = InterlockedCompareExchange64(&g_mvResourceGeneration, 0, 0);
+    LONG64 rtvCensusAltGenPre = InterlockedCompareExchange64(&g_mvResourceAltGeneration, 0, 0);
     if (res && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
         D3D12_RESOURCE_DESC rd = res->GetDesc();
         ObserveNativeCandidate(res, rd, 1);
@@ -4121,6 +4128,42 @@ void Hook_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* res,
         } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                    rd.MipLevels == 1 && rd.Width > 0 && rd.Height > 0) {
             { BookGuard _bg; g_rtvMap[handle.ptr] = res; }
+        }
+        // Observation-only RTV-adoption census (diagnostic): for MV-family
+        // candidates, record the inputs and the observable slot/generation
+        // outcome so a missing adoption can be attributed to a branch
+        // instead of guessed. Reuses rd/desc; no GetDesc calls, no resource
+        // dereference beyond what the chain above already performed, no
+        // stores, no behavior change. Pre/post slot comparison is
+        // best-effort under concurrency. Outer-skip calls (null desc or
+        // non-TEXTURE2D view) never reach this block and remain a blind
+        // spot by construction. Bounded: first 8 eligible records, then
+        // every 200th eligible record.
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            rd.MipLevels == 1 && rd.Width >= 1000 && rd.Height >= 500 &&
+            rd.Format == DXGI_FORMAT_R16G16_FLOAT && res && !IsOwnResource(res)) {
+            static volatile LONG s_rtvCensus = 0;
+            if (InterlockedIncrement(&s_rtvCensus) <= 8 ||
+                (s_rtvCensus % 200) == 0) {
+                LONG64 rtvCensusMvGenPost = InterlockedCompareExchange64(&g_mvResourceGeneration, 0, 0);
+                LONG64 rtvCensusAltGenPost = InterlockedCompareExchange64(&g_mvResourceAltGeneration, 0, 0);
+                Log("hooks: rtv-census res=%p rd=%ux%u fmt=%u dim=%u mips=%u samples=%u viewFmt=%u viewDim=%u gdev=%d "
+                    "preMv=%p preAlt=%p isMv=%d isAlt=%d postMv=%p postAlt=%p "
+                    "preMvGen=%lld postMvGen=%lld preAltGen=%lld postAltGen=%lld present=%llu ecl=%llu",
+                    (void*)res,
+                    (unsigned)rd.Width, (unsigned)rd.Height, (unsigned)rd.Format,
+                    (unsigned)rd.Dimension, (unsigned)rd.MipLevels, (unsigned)rd.SampleDesc.Count,
+                    (unsigned)desc->Format, (unsigned)desc->ViewDimension,
+                    (device && device == g_device) ? 1 : 0,
+                    (void*)rtvCensusMvPre, (void*)rtvCensusAltPre,
+                    (res == rtvCensusMvPre) ? 1 : 0,
+                    (res == rtvCensusAltPre) ? 1 : 0,
+                    (void*)g_mvResource, (void*)g_mvResourceAlt,
+                    (long long)rtvCensusMvGenPre, (long long)rtvCensusMvGenPost,
+                    (long long)rtvCensusAltGenPre, (long long)rtvCensusAltGenPost,
+                    (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+                    (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
+            }
         }
     }
     if (Real_CreateRenderTargetView)
