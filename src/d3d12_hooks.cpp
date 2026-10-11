@@ -1902,14 +1902,15 @@ struct ShimIntegritySnapshot {
     SIZE_T baseRegionSize;
     DWORD baseProtect;
     // Slot-by-slot comparison across the three tables (verified SDK slots:
-    // Close=9, Reset=10, CopyBufferRegion=15, CopyTextureRegion=16,
+    // Close=9, Reset=10, DrawInstanced=12, DrawIndexedInstanced=13,
+    // Dispatch=14, CopyBufferRegion=15, CopyTextureRegion=16,
     // ResourceBarrier=26, OMSetRenderTargets=46). Module basename recorded
     // only for actual entries differing from both saved tables.
     bool slotsReadable;
-    void* actualSlot[6];
-    void* origSlot[6];
-    void* clonedSlot[6];
-    wchar_t slotModBase[6][40];
+    void* actualSlot[9];
+    void* origSlot[9];
+    void* clonedSlot[9];
+    wchar_t slotModBase[9][40];
 };
 
 // Diagnostic only: classify one actual vtable entry against the saved tables.
@@ -2025,9 +2026,9 @@ static bool CaptureShimIntegrity(ID3D12GraphicsCommandList* list, ID3D12CommandL
     // Slot-by-slot table comparison. All three reads guarded as one unit: if
     // any table faults, the comparison is reported unreadable rather than
     // crashing. Module basename uses only manual loops (no CRT string calls).
-    static const int kCmpSlots[6] = { 9, 10, 15, 16, 26, 46 };
+    static const int kCmpSlots[9] = { 9, 10, 12, 13, 14, 15, 16, 26, 46 };
     out->slotsReadable = false;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 9; ++i) {
         out->actualSlot[i] = nullptr;
         out->origSlot[i] = nullptr;
         out->clonedSlot[i] = nullptr;
@@ -2038,7 +2039,7 @@ static bool CaptureShimIntegrity(ID3D12GraphicsCommandList* list, ID3D12CommandL
             void** at = (void**)actual;
             void** ot = (void**)original;
             void** ct = (void**)cloned;
-            for (int i = 0; i < 6; ++i) {
+            for (int i = 0; i < 9; ++i) {
                 out->actualSlot[i] = at[kCmpSlots[i]];
                 out->origSlot[i] = ot[kCmpSlots[i]];
                 out->clonedSlot[i] = ct[kCmpSlots[i]];
@@ -2047,7 +2048,7 @@ static bool CaptureShimIntegrity(ID3D12GraphicsCommandList* list, ID3D12CommandL
         } __except (EXCEPTION_EXECUTE_HANDLER) { }
     }
     if (out->slotsReadable) {
-        for (int i = 0; i < 6; ++i) {
+        for (int i = 0; i < 9; ++i) {
             void* av = out->actualSlot[i];
             if (!av || av == out->origSlot[i] || av == out->clonedSlot[i])
                 continue;
@@ -4688,7 +4689,7 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
                                     snap.baseRegionBase, (unsigned long long)snap.baseRegionSize,
                                     (unsigned)snap.baseProtect, logged);
                                 if (snap.slotsReadable) {
-                                    Log("hooks: ECL list slots list=%p s9=%s/%ls s10=%s/%ls s15=%s/%ls s16=%s/%ls s26=%s/%ls s46=%s/%ls (detail=%lld)",
+                                    Log("hooks: ECL list slots list=%p s9=%s/%ls s10=%s/%ls s12=%s/%ls s13=%s/%ls s14=%s/%ls s15=%s/%ls s16=%s/%ls s26=%s/%ls s46=%s/%ls (detail=%lld)",
                                         (void*)cl,
                                         SlotClass(snap.actualSlot[0], snap.origSlot[0], snap.clonedSlot[0]), snap.slotModBase[0],
                                         SlotClass(snap.actualSlot[1], snap.origSlot[1], snap.clonedSlot[1]), snap.slotModBase[1],
@@ -4696,6 +4697,9 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
                                         SlotClass(snap.actualSlot[3], snap.origSlot[3], snap.clonedSlot[3]), snap.slotModBase[3],
                                         SlotClass(snap.actualSlot[4], snap.origSlot[4], snap.clonedSlot[4]), snap.slotModBase[4],
                                         SlotClass(snap.actualSlot[5], snap.origSlot[5], snap.clonedSlot[5]), snap.slotModBase[5],
+                                        SlotClass(snap.actualSlot[6], snap.origSlot[6], snap.clonedSlot[6]), snap.slotModBase[6],
+                                        SlotClass(snap.actualSlot[7], snap.origSlot[7], snap.clonedSlot[7]), snap.slotModBase[7],
+                                        SlotClass(snap.actualSlot[8], snap.origSlot[8], snap.clonedSlot[8]), snap.slotModBase[8],
                                         logged);
                                 } else {
                                     Log("hooks: ECL list slots list=%p unreadable (detail=%lld)", (void*)cl, logged);
