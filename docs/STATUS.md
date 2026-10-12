@@ -1,5 +1,239 @@
 # Current project status and agenda
 
+## Checkpoint — 2026-10-12 (publication + Phase 1B Outcome B; no live test)
+
+### Publication state
+
+- Local `master @ 4c1574f` + working-tree census probe; `origin/master @ f4085ee`; five observation-only commits ahead (`7309312`, `acf56e8`…`4c1574f`), published by this task without squash or force-push. Dist binaries (`ASI 5694612C…`) are build-traced but intentionally NOT committed here (no rebuild authorized; they would go stale behind doc/INI commits — rebuild via `src/build_asi.bat`). Deployed plugin stays disabled (`asi.disabled 3401F0E0…` ≠ dist); deployed/dist INIs left untouched on disk.
+- Tracked `dist/ScaleNG.ini` restored to safe default `realInputs=0` (was test residue `1` since `8203f77`). Source default is `false` (`src/main.cpp:119`); INSTALL table already documents `0`. `--real-test` remains the only authorized temporary override (backup + restore verified in harness).
+- Correction: the 10/11 checkpoint below says census address fields were "not yet exercised" — superseded. Run `20261012T140657Z` (70s, `PASS_DLSS_EVAL`, 19 ZERO, `reobserveDiag=0`) exercised them: 10 `ECL list slots` details over 7 distinct lists (e.g. `:479 detail=1` … `:854 detail=10`), zero `reobserve: ATTACHED` lines. No game was launched for this publication task.
+
+### Verified progress
+
+- Working init + presentation path in historical tests; historical NGX feature creation + evaluation in some runs (`20261007T184502Z` earliest; `20261008T145625Z` last fresh REAL `ENGINE_MV+ENGINE_DEPTH`).
+- Offline RenderDoc baseline (`frame 19107.rdc`) showed engine-produced 1920×1080 `R16G16_FLOAT` velocity + `D24S8` depth — not live-identity proof.
+- 10/11 same-pointer join (`125031Z` exemplar `CD77380070`: install `:122-123` → NATs `:139-307` → hit `:414` → foreign `:493` → misses forever) established observation-loss sequence.
+- 10/12 bounded census with `reobserveDiag=0` (no attaches/reinstalls): OM/barrier/copy/Reset/Close targets stable-original across all 10 records; draw/Dispatch targets stable-identical into `nvwgf2umx.dll` (`7FFD961011B0/1D0/1F0`). Local diagnostic work preserved in full.
+
+### Leading diagnosis
+
+- Vtable transitions + pointer-only dedup (`WasListHooked`, `Install` dedup) starve barrier/OM observation — high confidence in sequence; foreign-table writer unknown. `140657Z` is ZERO-mode (`why=off`, no heartbeats) and does not independently establish the MV/depth touch-freeze join. Stable addresses ≠ safe hook point; in-place writer race unresolved.
+
+### Next step — Outcome B
+
+- No implementation or live experiment authorized by this update. Next is a **design review for bounded `Reset`/`Close` lifecycle snapshots**: establish whether entry/exit observations can be added safely, bounded, without touching the observed table or weakening REAL. Snapshot must distinguish recording vs Close/Reset vs post-submit transitions.
+
+### Unresolved goal (unchanged)
+
+- No run proves visibly effective DLSS-SR. All evals to date are DLAA-native (`render==display` after override); counts + handoff copies ≠ correct pixels. Still needed: sub-native color, valid MV/depth/jitter/params, frame association + GPU ordering, confirmed presentation, repeatable A/B, sustained-REAL gate. DLAA vs ZERO fallback vs REAL vs verified SR remain distinct. Safe default fail-closed; stale/retired/generation-stale/observation-starved kept distinct; acceptance gate unmet.
+
+## Checkpoint — 2026-10-11 (bounded command-list re-observation probe, built only)
+
+### Immediate result
+
+- The latest REAL-mode run (`20261011T125031Z`, PID 3968) reached freeroam but
+  had **zero REAL evaluations**. It produced 20 successful placeholder
+  evaluations/handoffs; its 6,018 REAL-mode validation heartbeats rejected
+  stale/mismatched observations. The harness reports zero Reset/eval failures
+  and zero fatal markers. `game_exit_code=1` is recorded, not diagnosed as a
+  crash. See `result.json` and `plugin_log_new.txt` in that run directory.
+- Reviewers confirmed the coverage failure: 208,968 sampled submission misses,
+  33 hits, 37 installs, 31 observed vtable changes across 35 tracked lists,
+  and zero submitted MV-recording observations. Repeated OM/DSV binds or
+  barrier sightings cannot safely be relabeled as fresh contents or same-frame
+  evidence.
+
+### Source change in this working tree (not deployed or live-tested)
+
+- Added an opt-in `commandListReobserveDiag` setting, default **off**, parsed
+  in `src/main.cpp` and applied in `HooksSetConfig`.
+- Extended the existing first-10 ECL mismatch detail to print the sampled
+  target addresses for slots 9/10/12/13/14/15/16/26/46 alongside their prior
+  class/module labels. This is a guarded read of the snapshot already in hand;
+  it adds no API call, object write, or per-call logging. Its purpose is to
+  establish whether a future function-entry observer has stable exact targets
+  for OM/draw/barrier, rather than assuming that slot-15 evidence generalizes.
+- When explicitly enabled, one direct command list whose vtable differs from
+  its registered ScaleNG clone may receive a **separate, one-shot diagnostic
+  clone** at ECL. It copies the currently observed table and only attaches if
+  all 64 entries exactly match the original table captured before ScaleNG's
+  first hook on that object; otherwise it rejects the table. It also rejects
+  any entry pointing at a ScaleNG command-list wrapper. It wraps only Reset,
+  Close, OM bind, direct Draw/DrawIndexed, and ResourceBarrier, and forwards
+  each to the exact saved entry from the copied table. It uses a pointer CAS
+  so a concurrent vtable replacement makes the attach fail rather than being
+  overwritten. It never retries after a later replacement; clone storage is
+  retained for process lifetime.
+- The diagnostic records only a bounded single-list sequence: OM descriptor
+  handles and current CPU-map pointer/generation lookups; direct draw events;
+  transition-barrier pointer/state arguments; successful Reset/Close; and a
+  later submission summary. It does **not** call `TrackOMBind`, `TrackResourceBarriers`,
+  camera patching, `CopyTexBody`, `TryVectorA/B`, or any REAL-input selector.
+  It does not update candidate timestamps, alter commands, or prove GPU
+  completion/content writes.
+- Coverage limits are explicit: it misses clears, Dispatch, ExecuteIndirect,
+  bundles, and commands recorded before attachment. A successful OM+draw pair
+  is evidence of recording intent on that list, not proof of depth writes or
+  pixel changes. A submission summary is not by itself a same-frame guarantee.
+- Build `src/build_asi.bat`: **PASS** after adding explicit forwarding for
+  wrapper calls that do not match the selected list and adding exact function
+  addresses to the existing bounded ECL slot census. Current
+  `dist/ScaleNG.asi` SHA-256
+  `5694612C45C4A6CEC86FCD50EE6F61037460753ED2AF3CCF17CB0AC52DDA7ADF`;
+  helper SHA-256
+  `D12F65800A2EEBCD19BCC1082D4A47FC69BBF3BE8CD4FDDF12F025DE2D937CCF`.
+  Independent read-only review of this revision found the intended wrapper
+  paths forward each selected call once; it did not find a normal duplicate or
+  dropped-command path. The earlier draft's missing-forwarder issue was fixed.
+  **Live-test blocker:** review cannot rule out another component editing the
+  original writable table in place between snapshot and attachment; pointer
+  CAS does not protect table contents. The probe must stay disabled until that
+  risk is bounded or a non-object-vtable observation route is used. Descriptor
+  map pointers and generations are diagnostic snapshots only and do not prove
+  resource liveness or identity at draw time.
+  A separate read-only artifact audit confirmed that old logs only partially
+  identify targets: startup logs provide saved-original OM/barrier addresses,
+  ECL rows classify those slots as original, and Draw slots are attributed to
+  the NVIDIA module without their raw addresses. Exact per-object Draw targets
+  cannot be recovered from old artifacts; the newly built address fields have
+  not yet been exercised in a game run.
+  The game plugin remains disabled; no install-folder file or runtime INI was
+  changed, and no gameplay test was run.
+- **Rollback:** remove the `commandListReobserveDiag` field/parser/config
+  assignment, `ReobserveListProbe` helpers/wrappers, and the ECL attach/summary
+  calls from `src/d3d12_hooks.cpp`, then rebuild. Because the setting defaults
+  off, setting it to `0` (or omitting it) prevents the new vtable attach without
+  a source rollback. Do not replace/restore the game plugin until a separate
+  approved deployment step.
+
+**Next:** collect a read-only target-address census from the bounded ECL detail
+after a user-approved test. Existing records show OM and barrier matching
+saved targets in sampled cases, while draw slots can differ into the NVIDIA
+module; old artifacts do not identify the exact Draw addresses, so exact
+cross-object targets are needed before choosing an observer.
+A MinHook function-entry observer could avoid changing each COM object's
+vtable but would patch shared, hot process code, and the project has prior
+warnings about command-list method detours. The current one-list clone probe
+also has an unresolved in-place table-writer race. Neither observation route
+is authorized or considered ready to enable. For the census, keep
+`commandListReobserveDiag=0`; it only adds bounded method-address fields to
+existing logs. Afterward compare stable targets and hook conflicts before
+proposing any method detour. REAL eligibility remains fail-closed; no claim of
+live fresh inputs or DLSS quality follows from this build.
+
+## Previous checkpoint — 2026-10-11 (offline RenderDoc resource lineage)
+
+### Follow-up — depth mapping and jitter (offline replay only)
+
+- **Depth mapping established for the captured GTAO pass:** replay event 2876
+  reads D24S8 resource 1075 as high-resolution depth. Its extracted constants
+  (`depthX=-0.100000799`, `depthY=-8.00006364e-06`) and shader formula
+  `viewDepth=depthX/(depthY-rawDepth)` were checked against all 2,073,600
+  captured R16_FLOAT view-depth outputs. The 2,073,600 pairs have mean absolute
+  error 2.0356 and maximum 4.0004 (consistent with half-float quantization at
+  the far end). Raw zero maps to ~12,500 and larger raw values map nearer:
+  this GTAO path is **reversed-Z-like**.
+- **Scope limit:** this is capture-local evidence for GTAO's sampled depth, not
+  proof that ScaleNG selects this same live resource, that its view/component
+  interpretation matches the offline readback, or that NGX accepts it without
+  conversion. Runtime identity, freshness, and same-evaluation association
+  remain open.
+- **Jitter remains unknown:** inspected camera constants contain no separately
+  identified jitter scalar. Current/previous projection matrices differ, but
+  one capture cannot distinguish temporal jitter from ordinary camera or
+  projection motion.
+- Evidence: `logs/pix_captures/rdoc_20261011T151530Z/analysis/` files
+  `replay_stage19_depth_constants.log` and
+  `replay_stage20_projection_jitter_probe.log`; capture hash unchanged.
+- Small diagnostic/documentation cleanup after review: the upscaler interface
+  comment no longer calls the raw depth input “linear”; the shadow-path comment
+  now distinguishes configured depth inversion from still-unknown live
+  convention, and the NGX feature/evaluation flag logs include
+  `DepthInverted`. This changes no gates, inputs, or rendering behavior.
+- Build: `src/build_asi.bat` succeeded (2026-10-11 22:17 local); output
+  `dist/ScaleNG.asi` SHA-256
+  `03404146B25C69408AAB8A5A221FF7257C1B402FA2CFF70A8968522F630197BC`.
+  No gameplay run or deployment. The game-side plugin remains disabled at
+  `plugins/ScaleNG.asi.disabled` with its prior hash
+  `3401F0E0A5639CAE2BD165C3A3A9221686183A229A790A0099E89B39D126C1B6`;
+  runtime INIs still say `realInputs=1` and `depthInverted=1`, but the disabled
+  plugin is not consuming them.
+
+**Runtime observation audit (run `20261011T125031Z`):** 73 seconds, reached
+gameplay; harness result **FAIL** because it saw zero REAL evaluations (20
+successful placeholder evaluations, 6,018 REAL-mode validation heartbeats,
+zero reset failures and zero fatal markers). `game_exit_code=1` is recorded
+without labeling it a crash. Final sampled counts: 37 installs, 33 ECL hits
+versus 208,968 misses, 31 vtable changes among 35 tracked lists, and zero
+submitted-recording MV observations. MV touch stayed at present 230. At
+present 842 depth was rejected as `depth-generation-stale`; the same captured
+descriptor handle later resolved to another resource, so handle identity
+alone is unsafe as a freshness signal.
+
+**Depth-flag audit:** `depthInverted` is read from INI, passed through
+initialization, and included in NGX feature-create flags. The capture's
+reversed-Z-like GTAO mapping agrees directionally with `depthInverted=1`, but
+that is not proof that ScaleNG's selected runtime depth is the same resource or
+that raw D24S8 is suitable to pass directly to NGX. The source has no depth
+linearization/conversion. A logging correction now reports the bit; prior
+evaluation-flag logs omitted it and must not be used to claim the bit was off.
+
+**Next:** the read-only audits now point to the command-list re-observation
+gap. A one-list re-observation pilot could copy the currently observed table
+into a ScaleNG-owned table and instrument the next recording, without writing
+the foreign table. However, it still changes that object's vtable pointer and
+risks racing a concurrent replacement or Reset. Before implementing, inspect
+the exact lifetime, table-capacity, and forwarding paths; any pilot must be
+diagnostic-only, capped at one list, and must not update REAL eligibility.
+Keep the plugin disabled and validation fail-closed until the pilot is reviewed.
+No same-frame, jitter, or DLSS quality claim follows from the offline capture.
+
+**New verified evidence from the existing no-ScaleNG capture** `frame 19107.rdc`
+(SHA-256 `FC45DF2F8103E61C4219DF81E404DCE1690F6E9B1A1A8718736318D3BC5313C1`):
+
+- Replay API corrects the earlier XML count: **153 indexed draws** target
+  resource 1080; four compute dispatches account for the old 157-operation
+  wording. Resource 1080 is 1920x1080 `R16G16_FLOAT`. DSV 1075 is bound during
+  those draws, but binding alone does not prove depth testing was enabled.
+- At replay event **2876**, descriptor resolution identifies 1080 as the
+  shader's `g_srcVelocity` and 1075 as `g_srcHighResDepth`; the GTAO compute
+  shader samples both. These are concrete same-dispatch inputs for this AO
+  pass, not proof they are DLSS/TAA inputs.
+- The writer shader uses current and previous projected positions and computes
+  approximately previous-minus-current normalized screen-UV displacement
+  (Y converted to top-left coordinates), clamped to magnitude 0.5. The
+  projection matrices may already include camera jitter; that remains unknown.
+- Offline RenderDoc `GetTextureData(1080)` at event 2876 returned 8,294,400
+  bytes. All 2,073,600 RG16F pixels were finite and nonzero; max abs X/Y were
+  0.07641602 / 0.04385376, max magnitude 0.08810539. This proves populated
+  data in this one captured frame, not that every value is a correct NGX vector.
+- AO lineage is now pointer-resolved through the visible frame: event 2883
+  reads AO-pass outputs and writes 1087; event 3098 samples 1087 as
+  `ambientOcclusionBuffer` while drawing scene color 296482; event 4090 samples
+  296482 and writes 1051; event 4203 samples 1051 and writes swapchain buffer
+  1050. This establishes that the MV/depth-fed AO output contributes to this
+  capture's presented image, indirectly through AO. It does not establish NGX
+  suitability or a direct temporal upscaler input path.
+- The depth descriptor metadata reports D24S8/depth with a four-byte element;
+  the shader reads it as `Texture2D<float>`. Exact view interpretation,
+  depth convention/range, and NGX conversion requirements remain unresolved.
+
+**Files/evidence:** detailed audit and event IDs are in
+`logs/pix_captures/rdoc_20261011T151530Z/analysis/CANDIDATES.md` and the
+`replay_stage12`–`replay_stage17` logs/disassembly in that directory. Capture
+hash rechecked unchanged. No source/config edits, build, game launch, or plugin
+enablement occurred. The pre-existing `src/d3d12_hooks.cpp` Option-A working
+diff remains untouched; game `ScaleNG.asi` remains disabled and matches the
+expected hash `3401F0E0A5639CAE2BD165C3A3A9221686183A229A790A0099E89B39D126C1B6`.
+
+**Next:** use replay-only evidence to inspect camera-jitter treatment and depth
+semantics, then determine whether the GTAO input resources can be safely
+observed at runtime without relying on the command-list clone hooks that lose
+coverage. Keep REAL fail-closed. A single capture establishes neither stable
+runtime identity nor same-frame association for ScaleNG; no DLSS evaluation or
+quality gain is claimed. Preserve all existing working-tree changes and
+artifacts; no commit/push was made.
+
 ## Checkpoint — 2026-10-10 (motion-information blocker: read-only trace complete)
 
 ### Q1: Why does REAL reject with `mv-retired`?

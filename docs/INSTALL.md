@@ -46,7 +46,8 @@ The file is read once at load; **INI changes require a game restart**.
 | `ngxApiVersion` | 21 | NGX API version passed to Init |
 | `shadowHandoff` | 1 | Write eval output into the presented frame (also F8) |
 | `abWindow` | 0 | 0 = steady manual control; nonzero auto-alternates handoff ON/OFF per N presents (bot captures) |
-| `realInputs` | 0 | Engine MV/depth instead of zero placeholders (also F9); fail-closed to zeros |
+| `realInputs` | 0 | Engine MV/depth instead of zero placeholders (also F9); fail-closed to zeros. The tracked `dist` default is `0`; `--real-test` temporarily sets deployed `realInputs=1` and restores the original bytes afterward (backup `runtime_ini_before_real_test.ini`, result field `real_test_ini_restored`) |
+| `commandListReobserveDiag` | 0 | Bounded one-list ECL address census only; never forces reinstalls. Keep `0` unless a reviewed census is authorized |
 | `dlaa` | 0 | **1 currently yields no eval path (silent no-op)** |
 | `hud` | 1 | HUD overlay bit (overlay drawing itself inert) |
 | `legacyScale`, `passive`, `jitterPattern` | 0, 0, halton | Parsed but ineffectual (logged only) |

@@ -5,13 +5,14 @@ UAL-loaded ASI plugin. The plugin hooks the game's D3D12 calls, evaluates
 NVIDIA DLSS on presented frames, and hands the result back into the
 presented backbuffer.
 
-## Current state (2026-10-08) — Post-DLSS initialization era
+## Current state (2026-10-12) — Post-DLSS initialization era, observation-starved REAL path
 
 - **Boundary:** run `20261007T165257Z` is the first verified NGX
   `Init_Ext` + feature + evals (loader commit `5e2b6c2`).
   Pre-DLSS initialization history lives in
   [docs/archive/](docs/archive/README.md); everything below is
-  Post-DLSS initialization.
+  Post-DLSS initialization. See [docs/STATUS.md](docs/STATUS.md) as the
+  operational source of truth; this section is a summary.
 - **Working:** DLAA-native shadow eval (render == display ==
   backbuffer) → thousands of consecutive evaluated + presented
   frames (ok `#N` counters; `ok` lines are sampled). Best streaks:
@@ -21,21 +22,39 @@ presented backbuffer.
   (20261007T194541Z), zeros `#7800` refs. User run
   20261007T204943Z: 7 F9 REAL engagements (genuine MV + SELF zero
   depth) with null visual. F8 visibly gates the handoff (default
-  ON); F9 switches input sets with fail-closed fallback to owned
-  zero MV/depth placeholders. Jitter 0/0, mvScale 1.0 on zeros /
+  ON) while evaluations run; F9 switches input sets with fail-closed
+  fallback to owned zero MV/depth placeholders (no REAL effect when
+  the breaker has halted evaluation or when validation rejects stale
+  inputs). Jitter 0/0, mvScale 1.0 on zeros /
   W×H on real, HDR default with F7 LDR toggle, sharpness
-  SDK-unsupported. 30/120 fault breaker is live but UNFIRED;
+  SDK-unsupported. 30/120 fault breaker is live and HAS fired
+  (run 20261008T152749Z: reset at 30 faults, halt at 120);
   self-adopt guard blocked in all observed cases.
+- **Leading diagnosis (high confidence in sequence, writer unknown):**
+  command-list vtable transitions + pointer-only reinstall dedup starve
+  barrier/OM observation; freshness gates then fail closed
+  (`mv-stale-present`, `mv-retired`, `depth-generation-stale` kept
+  distinct). The 20261011 same-pointer join and the 20261012 bounded
+  census (`reobserveDiag=0`, no attaches; OM/barrier/copy targets
+  stable-original, draw targets stable-identical into
+  `nvwgf2umx.dll`) are recorded in STATUS.md. Decision: Outcome B —
+  next is a design review for bounded `Reset`/`Close` lifecycle
+  snapshots, not a reinstall or live run.
 - **Not proven:** image-quality improvement (no controlled comparison
   yet), same-frame input association, MV/depth value semantics,
-  baseline crash-freedom (UNKNOWN — one CreateFeature crash
-  192627Z + 1904-fault cluster 194541Z + 7390-storm 200904Z
-  starting 1 ms after an F9 press, F9 involvement UNRESOLVED both
-  directions). Failures present the original frame except the
-  192627Z crash. Run 120239Z contains 8 F9 toggles — not a
-  pure-zeros reference.
+  sub-native color input (all evals to date are DLAA-native after the
+  sizing override), correct jitter/exposure, GPU ordering proof,
+  output-presentation proof. Baseline crash-freedom UNKNOWN — one
+  CreateFeature crash 192627Z + 1904-fault cluster 194541Z +
+  7390-storm 200904Z (F9 involvement UNRESOLVED both directions) +
+  early-loading purge crashes 20261009T231132Z/20261010T124606Z under
+  separate investigation. Failures present the original frame except
+  the 192627Z crash. Run 120239Z contains 8 F9 toggles — not a
+  pure-zeros reference. Eval counts + handoff bits do not prove
+  correct output pixels; the sustained-REAL acceptance gate is unmet.
 - **Defaults are the safe fallback:** zero MV/depth inputs, handoff on,
-  real inputs off. See [docs/INSTALL.md](docs/INSTALL.md) (config table)
+  real inputs off (`dist` default `realInputs=0`; `--real-test`
+  overrides temporarily and restores). See [docs/INSTALL.md](docs/INSTALL.md) (config table)
   and [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) (what the build does).
 
 ## Read in this order

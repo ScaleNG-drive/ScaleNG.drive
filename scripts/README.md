@@ -28,6 +28,13 @@ scripts\launch_test.bat --duration 30
 scripts\launch_test.bat --skip-build --no-deploy --duration 60
 ```
 
+`--real-test` temporarily sets deployed `[ScaleNG] realInputs=1`
+(no synthetic keypress), backs up the pre-run INI to
+`runtime_ini_before_real_test.ini`, and restores the original bytes
+afterward (`real_test_ini_restored` in `result.json`). The tracked
+`dist` default stays `realInputs=0`; do not commit a test override
+as a default.
+
 Requirements: Windows, Visual Studio C++ build tools, BeamNG.drive at
 `C:\Games\BeamNG.drive`, Python, and the BeamNGpy version matching the game
 protocol. BeamNG 0.39.3 uses TCom v1.26; create a dedicated environment using

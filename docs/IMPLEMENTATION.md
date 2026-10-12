@@ -55,8 +55,8 @@ never true).
    (defined `src/dlss_ngx.h:50`) is never set — correct iff the MV is
    full-res, which the eval path enforces by size check
    (`src/d3d12_hooks.cpp:7172`); `DepthInverted` (defined
-   `src/dlss_ngx.h:52`) is never set, i.e. the code assumes the standard
-   near-0/far-1 convention — UNPROVEN, near/far planes are never sent;
+   `src/dlss_ngx.h:52`) is set at feature creation and (working tree) at evaluation — still UNPROVEN live;
+   near/far planes are never sent; INI `depthInverted` defaults OFF in source, ON in `dist` config;
    `AutoExposure`
    (INI `autoExposure=1`, no exposure texture supplied). Camera matrices
    (`InvViewProjectionMatrix` / `ClipToPrevClipMatrix`) are deliberately
