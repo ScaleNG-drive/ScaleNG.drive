@@ -21,7 +21,7 @@ struct UpscalerInitParams {
 struct UpscalerEvaluateParams {
     ID3D12GraphicsCommandList* commandList = nullptr;
     ID3D12Resource* color = nullptr;          // SRV-able input color (full-res resource, render rect = renderWidth/Height)
-    ID3D12Resource* depth = nullptr;          // SRV-able depth (D24/D32, linear, same render rect)
+    ID3D12Resource* depth = nullptr;          // SRV-able depth input; caller must validate convention (no linearization here)
     ID3D12Resource* motionVectors = nullptr;  // SRV-able velocity (R16G16_FLOAT, UV-space [0,1] deltas)
     ID3D12Resource* output = nullptr;         // UAV-able output (display res, R16G16B16A16_UNORM)
     float jitterX = 0.0f;                     // render pixels

@@ -631,9 +631,9 @@ bool NvDlssUpscaler::CreateFeature(ID3D12GraphicsCommandList* cmdList)
     }
 
     m_featureCreated = true;
-    Log("DLSS: feature created (render %ux%u -> display %ux%u %s)",
+    Log("DLSS: feature created (render %ux%u -> display %ux%u %s flags=0x%X)",
         m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight,
-        m_forceHDR ? "HDR" : "LDR");
+        m_forceHDR ? "HDR" : "LDR", (unsigned)flags);
     return true;
 }
 
@@ -750,6 +750,7 @@ bool NvDlssUpscaler::Evaluate(const UpscalerEvaluateParams& params)
     int evalFlags = m_forceHDR ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0;
     if (m_mvJittered) evalFlags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
     if (m_autoExposure) evalFlags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    if (m_depthInverted) evalFlags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     static volatile LONG s_evParamLogs = 0;
     LONG epn = InterlockedIncrement(&s_evParamLogs);
     if (epn <= 10 || (epn % 600) == 0)
