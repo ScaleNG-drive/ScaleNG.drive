@@ -19,6 +19,7 @@ struct ScaleNgConfig {
     unsigned int abWindow = 0; // auto-alternation window in presents (0 = steady, no alternation)
     bool realInputs = false; // feed engine MV/depth to shadow-eval (F9 toggles live; default zeros)
     bool depthInverted = false; // engine uses reversed-Z depth convention (NGX DepthInverted flag)
+    bool commandListReobserveDiag = false; // diagnostic-only one-list proxy for future recordings after foreign vtable replacement
     wchar_t dlssDllPath[MAX_PATH] = {};
 };
 

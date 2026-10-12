@@ -118,6 +118,7 @@ static void LoadConfig()
     g_config.abWindow = (unsigned int)getInt(L"abWindow", 0);
     g_config.realInputs = getBool(L"realInputs", false);
     g_config.depthInverted = getBool(L"depthInverted", false);
+    g_config.commandListReobserveDiag = getBool(L"commandListReobserveDiag", false);
     g_config.enabled = getBool(L"enabled", true);
 
     wchar_t upscaler[32] = {};
@@ -210,10 +211,11 @@ extern "C" __declspec(dllexport) void InitializeASI()
             Log("ScaleNG.asi disabled via config - no hooks installed");
             return;
         }
-        Log("config: renderScale=%.2f sharpness=%.2f perfQuality=%d mvJittered=%d autoExposure=%d appId=%u dlaa=%d hud=%d legacyScale=%d",
+        Log("config: renderScale=%.2f sharpness=%.2f perfQuality=%d mvJittered=%d autoExposure=%d appId=%u dlaa=%d hud=%d legacyScale=%d reobserveDiag=%d",
             g_config.renderScale, g_config.sharpness, g_config.perfQuality,
             g_config.mvJittered ? 1 : 0, g_config.autoExposure ? 1 : 0, g_config.appId,
-            g_config.dlaa ? 1 : 0, g_config.hud ? 1 : 0, g_config.legacyScale ? 1 : 0);
+            g_config.dlaa ? 1 : 0, g_config.hud ? 1 : 0, g_config.legacyScale ? 1 : 0,
+            g_config.commandListReobserveDiag ? 1 : 0);
         Log("init: setting config");
         HooksSetConfig(g_config);
         Log("init: installing D3D12CreateDevice detour");

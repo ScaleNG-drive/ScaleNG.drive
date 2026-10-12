@@ -1303,6 +1303,18 @@ static HRESULT STDMETHODCALLTYPE Shim_CommandListReset(ID3D12GraphicsCommandList
 static void STDMETHODCALLTYPE Shim_DrawInstanced(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
 static void STDMETHODCALLTYPE Shim_DrawIndexedInstanced(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
 static void STDMETHODCALLTYPE Shim_Dispatch(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
+static void STDMETHODCALLTYPE Shim_CopyBufferRegion(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64,
+    ID3D12Resource*, UINT64, UINT64);
+static void STDMETHODCALLTYPE Shim_CopyTextureRegion(ID3D12GraphicsCommandList*,
+    const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
+static void STDMETHODCALLTYPE Shim_CopyResource(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*);
+static void STDMETHODCALLTYPE Shim_SetGraphicsRootDescriptorTable(ID3D12GraphicsCommandList*, UINT,
+    D3D12_GPU_DESCRIPTOR_HANDLE);
+static void STDMETHODCALLTYPE Shim_RSSetViewports(ID3D12GraphicsCommandList*, UINT, const D3D12_VIEWPORT*);
+static void STDMETHODCALLTYPE Shim_RSSetScissorRects(ID3D12GraphicsCommandList*, UINT, const D3D12_RECT*);
+static void STDMETHODCALLTYPE Shim_ResourceBarrier(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
+static void STDMETHODCALLTYPE Shim_OMSetRenderTargets(ID3D12GraphicsCommandList*, UINT,
+    const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_ResourceMap)(ID3D12Resource*, UINT, const D3D12_RANGE*, void**);
 typedef void (STDMETHODCALLTYPE* PFN_ResourceUnmap)(ID3D12Resource*, UINT, const D3D12_RANGE*);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommittedResource)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
@@ -1437,6 +1449,46 @@ static volatile LONG64 g_resourceMapCalls = 0;
 
 static CommandListShim g_commandListShims[64] = {};
 static SRWLOCK g_commandListShimLock = SRWLOCK_INIT;
+// Opt-in, one-object diagnostic proxy. It is intentionally separate from the
+// behavior-bearing CommandListShim registry: its wrappers only snapshot
+// recording arguments and forward to the exact table captured at attachment.
+struct ReobserveListProbe {
+    volatile LONG state; // 0 unused, 1 active, 2 attachment failed
+    volatile LONG proxyLost;
+    ID3D12GraphicsCommandList* list;
+    void** observedVtbl;
+    void** clonedVtbl;
+    PFN_CommandListReset reset;
+    PFN_CommandListClose close;
+    PFN_DrawInstanced drawInstanced;
+    PFN_DrawIndexedInstanced drawIndexedInstanced;
+    PFN_ResourceBarrier resourceBarrier;
+    PFN_OMSetRenderTargets omSetRenderTargets;
+    volatile LONG64 epoch;
+    volatile LONG recordingClosed;
+    volatile LONG resetFailed;
+    volatile LONG64 eventSeq;
+    volatile LONG64 omCount;
+    volatile LONG64 drawCount;
+    volatile LONG64 barrierCount;
+    volatile LONG64 lastRtvHandle;
+    volatile LONG64 lastDsvHandle;
+    volatile LONG64 lastRtvResource;
+    volatile LONG64 lastDsvResource;
+    volatile LONG64 lastRtvGeneration;
+    volatile LONG64 lastDsvGeneration;
+    volatile LONG64 lastSubmittedEpoch;
+};
+static ReobserveListProbe g_reobserveListProbe = {};
+static volatile LONG g_reobserveListProbeAttempted = 0;
+static volatile LONG64 g_reobserveListProbeEventsLogged = 0;
+static volatile LONG64 g_reobserveListProbeSubmitsLogged = 0;
+static volatile LONG g_commandListReobserveDiag = 0;
+static void TryInstallReobserveListProbe(ID3D12GraphicsCommandList* list,
+                                         void** expectedVtbl, void** expectedClone,
+                                         void** expectedOriginal);
+static void ObserveReobserveListProbeSubmission(ID3D12CommandQueue* queue,
+                                               ID3D12GraphicsCommandList* list);
 // Exact diagnostic totals (atomic; snapshots reported on sampled log records).
 static volatile LONG64 g_installCallsTotal = 0;
 static volatile LONG64 g_installOkTotal = 0;
@@ -1844,7 +1896,8 @@ static void NoteMvOmTarget(ID3D12GraphicsCommandList* list,
 // current vtable.Reports the actual vtable vs the expected cloned/original so a
 // miss can be classified as vtable-restored vs never-registered. No behavior change.
 static bool FindShimByListOnly(ID3D12GraphicsCommandList* list, void** actualVtblOut,
-                               void** expectedClonedOut, void** expectedOriginalOut)
+                               void** expectedClonedOut, void** expectedOriginalOut,
+                               UINT* listTypeOut)
 {
     if (!list) return false;
     void** vtbl = nullptr;
@@ -1856,12 +1909,384 @@ static bool FindShimByListOnly(ID3D12GraphicsCommandList* list, void** actualVtb
         if (shim.list == list) {
             if (expectedClonedOut) *expectedClonedOut = shim.clonedVtbl;
             if (expectedOriginalOut) *expectedOriginalOut = shim.originalVtbl;
+            if (listTypeOut) *listTypeOut = shim.listType;
             found = true;
             break;
         }
     }
     ReleaseSRWLockShared(&g_commandListShimLock);
     return found;
+}
+
+static ReobserveListProbe* FindReobserveListProbe(ID3D12GraphicsCommandList* list)
+{
+    if (InterlockedCompareExchange(&g_reobserveListProbe.state, 0, 0) != 1 ||
+        g_reobserveListProbe.list != list)
+        return nullptr;
+    return &g_reobserveListProbe;
+}
+
+static ReobserveListProbe* GetActiveReobserveListProbe()
+{
+    return InterlockedCompareExchange(&g_reobserveListProbe.state, 0, 0) == 1
+        ? &g_reobserveListProbe : nullptr;
+}
+
+static void ReobserveListProbeLogEvent(ReobserveListProbe* probe, const char* event,
+                                      unsigned long long sequence,
+                                      unsigned long long detailA = 0,
+                                      unsigned long long detailB = 0,
+                                      unsigned long long detailC = 0)
+{
+    if (!probe) return;
+    LONG64 logged = InterlockedIncrement64(&g_reobserveListProbeEventsLogged);
+    // One selected list only. Bound total output while retaining the beginning
+    // of each recording and a sparse long-run sample.
+    if (logged <= 64 || (logged % 500) == 0) {
+        Log("reobserve: event=%s list=%p epoch=%lld seq=%llu a=%llX b=%llX c=%llX present=%llu ecl=%llu",
+            event, (void*)probe->list,
+            (long long)InterlockedCompareExchange64(&probe->epoch, 0, 0),
+            sequence, detailA, detailB, detailC,
+            (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+            (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE Shim_ReobserveReset(ID3D12GraphicsCommandList* list,
+    ID3D12CommandAllocator* allocator, ID3D12PipelineState* initialState)
+{
+    ReobserveListProbe* forwarder = GetActiveReobserveListProbe();
+    ReobserveListProbe* probe = forwarder && forwarder->list == list ? forwarder : nullptr;
+    PFN_CommandListReset reset = forwarder ? forwarder->reset : nullptr;
+    if (!reset) reset = (PFN_CommandListReset)ResolveCommandListForward(
+        list, 10, (void*)&Shim_ReobserveReset);
+    if (!reset) return E_POINTER;
+    HRESULT hr = reset(list, allocator, initialState);
+    if (!probe) return hr; // a copied proxy table still forwards, but is not sampled
+    if (SUCCEEDED(hr)) {
+        LONG64 epoch = InterlockedIncrement64(&probe->epoch);
+        InterlockedExchange(&probe->recordingClosed, 0);
+        InterlockedExchange(&probe->resetFailed, 0);
+        InterlockedExchange64(&probe->eventSeq, 0);
+        InterlockedExchange64(&probe->omCount, 0);
+        InterlockedExchange64(&probe->drawCount, 0);
+        InterlockedExchange64(&probe->barrierCount, 0);
+        InterlockedExchange64(&probe->lastRtvHandle, 0);
+        InterlockedExchange64(&probe->lastDsvHandle, 0);
+        InterlockedExchange64(&probe->lastRtvResource, 0);
+        InterlockedExchange64(&probe->lastDsvResource, 0);
+        InterlockedExchange64(&probe->lastRtvGeneration, 0);
+        InterlockedExchange64(&probe->lastDsvGeneration, 0);
+        ReobserveListProbeLogEvent(probe, "reset-ok", (unsigned long long)epoch,
+            (unsigned long long)(unsigned)hr);
+    } else {
+        InterlockedExchange(&probe->resetFailed, 1);
+        ReobserveListProbeLogEvent(probe, "reset-failed",
+            (unsigned long long)InterlockedCompareExchange64(&probe->eventSeq, 0, 0),
+            (unsigned long long)(unsigned)hr);
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE Shim_ReobserveClose(ID3D12GraphicsCommandList* list)
+{
+    ReobserveListProbe* forwarder = GetActiveReobserveListProbe();
+    ReobserveListProbe* probe = forwarder && forwarder->list == list ? forwarder : nullptr;
+    PFN_CommandListClose close = forwarder ? forwarder->close : nullptr;
+    if (!close) close = (PFN_CommandListClose)ResolveCommandListForward(
+        list, 9, (void*)&Shim_ReobserveClose);
+    if (!close) return E_POINTER;
+    HRESULT hr = close(list);
+    if (!probe) return hr;
+    if (SUCCEEDED(hr)) InterlockedExchange(&probe->recordingClosed, 1);
+    ReobserveListProbeLogEvent(probe, SUCCEEDED(hr) ? "close-ok" : "close-failed",
+        (unsigned long long)InterlockedCompareExchange64(&probe->eventSeq, 0, 0),
+        (unsigned long long)(unsigned)hr,
+        (unsigned long long)InterlockedCompareExchange64(&probe->omCount, 0, 0),
+        (unsigned long long)InterlockedCompareExchange64(&probe->drawCount, 0, 0));
+    return hr;
+}
+
+static void STDMETHODCALLTYPE Shim_ReobserveOM(ID3D12GraphicsCommandList* list,
+    UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* handles, BOOL singleRange,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
+{
+    ReobserveListProbe* forwarder = GetActiveReobserveListProbe();
+    ReobserveListProbe* probe = forwarder && forwarder->list == list ? forwarder : nullptr;
+    PFN_OMSetRenderTargets omSet = forwarder ? forwarder->omSetRenderTargets : nullptr;
+    if (!omSet) omSet = (PFN_OMSetRenderTargets)ResolveCommandListForward(
+        list, 46, (void*)&Shim_ReobserveOM);
+    if (!omSet) return;
+    if (!probe) { omSet(list, count, handles, singleRange, depth); return; }
+    SIZE_T rtvHandle = (handles && count) ? handles[0].ptr : 0;
+    SIZE_T dsvHandle = depth ? depth->ptr : 0;
+    ID3D12Resource* rtvResource = nullptr;
+    ID3D12Resource* dsvResource = nullptr;
+    {
+        BookGuard guard;
+        if (rtvHandle) {
+            auto it = g_rtvMap.find(rtvHandle);
+            if (it != g_rtvMap.end()) rtvResource = it->second;
+        }
+        if (dsvHandle) {
+            auto it = g_dsvMap.find(dsvHandle);
+            if (it != g_dsvMap.end()) dsvResource = it->second;
+        }
+    }
+    const LONG64 rtvGen = rtvResource ? GetResourceAddressGeneration(rtvResource) : 0;
+    const LONG64 dsvGen = dsvResource ? GetResourceAddressGeneration(dsvResource) : 0;
+    InterlockedExchange64(&probe->lastRtvHandle, (LONG64)rtvHandle);
+    InterlockedExchange64(&probe->lastDsvHandle, (LONG64)dsvHandle);
+    InterlockedExchange64(&probe->lastRtvResource, (LONG64)(ULONG_PTR)rtvResource);
+    InterlockedExchange64(&probe->lastDsvResource, (LONG64)(ULONG_PTR)dsvResource);
+    InterlockedExchange64(&probe->lastRtvGeneration, rtvGen);
+    InterlockedExchange64(&probe->lastDsvGeneration, dsvGen);
+    LONG64 seq = InterlockedIncrement64(&probe->eventSeq);
+    InterlockedIncrement64(&probe->omCount);
+    ReobserveListProbeLogEvent(probe, "om", (unsigned long long)seq,
+        (unsigned long long)rtvHandle,
+        (unsigned long long)(ULONG_PTR)rtvResource,
+        (unsigned long long)(ULONG_PTR)dsvResource);
+    omSet(list, count, handles, singleRange, depth);
+}
+
+static void STDMETHODCALLTYPE Shim_ReobserveDraw(ID3D12GraphicsCommandList* list,
+    UINT vertexCount, UINT instanceCount, UINT startVertex, UINT startInstance)
+{
+    ReobserveListProbe* forwarder = GetActiveReobserveListProbe();
+    ReobserveListProbe* probe = forwarder && forwarder->list == list ? forwarder : nullptr;
+    PFN_DrawInstanced draw = forwarder ? forwarder->drawInstanced : nullptr;
+    if (!draw) draw = (PFN_DrawInstanced)ResolveCommandListForward(
+        list, 12, (void*)&Shim_ReobserveDraw);
+    if (!draw) return;
+    if (!probe) { draw(list, vertexCount, instanceCount, startVertex, startInstance); return; }
+    LONG64 seq = InterlockedIncrement64(&probe->eventSeq);
+    InterlockedIncrement64(&probe->drawCount);
+    ReobserveListProbeLogEvent(probe, "draw", (unsigned long long)seq,
+        (unsigned long long)InterlockedCompareExchange64(&probe->lastRtvResource, 0, 0),
+        (unsigned long long)InterlockedCompareExchange64(&probe->lastDsvResource, 0, 0),
+        (unsigned long long)vertexCount);
+    draw(list, vertexCount, instanceCount, startVertex, startInstance);
+}
+
+static void STDMETHODCALLTYPE Shim_ReobserveDrawIndexed(ID3D12GraphicsCommandList* list,
+    UINT indexCount, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance)
+{
+    ReobserveListProbe* forwarder = GetActiveReobserveListProbe();
+    ReobserveListProbe* probe = forwarder && forwarder->list == list ? forwarder : nullptr;
+    PFN_DrawIndexedInstanced draw = forwarder ? forwarder->drawIndexedInstanced : nullptr;
+    if (!draw) draw = (PFN_DrawIndexedInstanced)ResolveCommandListForward(
+        list, 13, (void*)&Shim_ReobserveDrawIndexed);
+    if (!draw) return;
+    if (!probe) { draw(list, indexCount, instanceCount, startIndex, baseVertex, startInstance); return; }
+    LONG64 seq = InterlockedIncrement64(&probe->eventSeq);
+    InterlockedIncrement64(&probe->drawCount);
+    ReobserveListProbeLogEvent(probe, "draw-indexed", (unsigned long long)seq,
+        (unsigned long long)InterlockedCompareExchange64(&probe->lastRtvResource, 0, 0),
+        (unsigned long long)InterlockedCompareExchange64(&probe->lastDsvResource, 0, 0),
+        (unsigned long long)indexCount);
+    draw(list, indexCount, instanceCount, startIndex, baseVertex, startInstance);
+}
+
+static void STDMETHODCALLTYPE Shim_ReobserveBarrier(ID3D12GraphicsCommandList* list,
+    UINT count, const D3D12_RESOURCE_BARRIER* barriers)
+{
+    ReobserveListProbe* forwarder = GetActiveReobserveListProbe();
+    ReobserveListProbe* probe = forwarder && forwarder->list == list ? forwarder : nullptr;
+    PFN_ResourceBarrier barrier = forwarder ? forwarder->resourceBarrier : nullptr;
+    if (!barrier) barrier = (PFN_ResourceBarrier)ResolveCommandListForward(
+        list, 26, (void*)&Shim_ReobserveBarrier);
+    if (!barrier) return;
+    if (!probe) { barrier(list, count, barriers); return; }
+    UINT loggedBarriers = count < 8 ? count : 8;
+    for (UINT i = 0; barriers && i < loggedBarriers; ++i) {
+        if (barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
+        LONG64 seq = InterlockedIncrement64(&probe->eventSeq);
+        InterlockedIncrement64(&probe->barrierCount);
+        ReobserveListProbeLogEvent(probe, "barrier", (unsigned long long)seq,
+            (unsigned long long)(ULONG_PTR)barriers[i].Transition.pResource,
+            (unsigned long long)barriers[i].Transition.StateBefore,
+            (unsigned long long)barriers[i].Transition.StateAfter);
+    }
+    barrier(list, count, barriers);
+}
+
+static bool IsOurCommandListWrapper(void* fn)
+{
+    return fn == (void*)&Shim_CommandListClose || fn == (void*)&Shim_CommandListReset ||
+           fn == (void*)&Shim_DrawInstanced || fn == (void*)&Shim_DrawIndexedInstanced ||
+           fn == (void*)&Shim_Dispatch || fn == (void*)&Shim_CopyBufferRegion ||
+           fn == (void*)&Shim_CopyTextureRegion || fn == (void*)&Shim_CopyResource ||
+           fn == (void*)&Shim_SetGraphicsRootDescriptorTable ||
+           fn == (void*)&Shim_RSSetViewports || fn == (void*)&Shim_RSSetScissorRects ||
+           fn == (void*)&Shim_ResourceBarrier || fn == (void*)&Shim_OMSetRenderTargets ||
+           fn == (void*)&Shim_ReobserveClose || fn == (void*)&Shim_ReobserveReset ||
+           fn == (void*)&Shim_ReobserveDraw || fn == (void*)&Shim_ReobserveDrawIndexed ||
+           fn == (void*)&Shim_ReobserveBarrier || fn == (void*)&Shim_ReobserveOM;
+}
+
+static void TryInstallReobserveListProbe(ID3D12GraphicsCommandList* list,
+                                         void** expectedVtbl, void** expectedClone,
+                                         void** expectedOriginal)
+{
+    if (!list || !expectedVtbl || !expectedClone || !expectedOriginal ||
+        InterlockedCompareExchange(&g_commandListReobserveDiag, 0, 0) == 0 ||
+        InterlockedCompareExchange(&g_reobserveListProbeAttempted, 1, 0) != 0)
+        return;
+    void** actual = nullptr;
+    __try { actual = *(void***)list; } __except (EXCEPTION_EXECUTE_HANDLER) { actual = nullptr; }
+    if (!actual || actual != expectedVtbl || actual == expectedClone) {
+        InterlockedExchange(&g_reobserveListProbe.state, 2);
+        Log("reobserve: attach skipped list=%p expected=%p clone=%p actual=%p reason=changed-before-copy",
+            (void*)list, expectedVtbl, expectedClone, actual);
+        return;
+    }
+    constexpr SIZE_T kEntries = 64;
+    void** clone = (void**)VirtualAlloc(nullptr, sizeof(void*) * kEntries,
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!clone) {
+        InterlockedExchange(&g_reobserveListProbe.state, 2);
+        Log("reobserve: attach failed list=%p reason=allocation", (void*)list);
+        return;
+    }
+    bool copied = true;
+    __try { std::memcpy(clone, actual, sizeof(void*) * kEntries); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { copied = false; }
+    if (!copied) {
+        VirtualFree(clone, 0, MEM_RELEASE);
+        InterlockedExchange(&g_reobserveListProbe.state, 2);
+        Log("reobserve: attach failed list=%p reason=table-copy-fault", (void*)list);
+        return;
+    }
+    // Only layer on a table whose complete method array exactly matches the
+    // original captured before ScaleNG first hooked this object. Otherwise a
+    // foreign forwarding wrapper could call back through the object's current
+    // vtable and recurse into this probe. Reject any unclassified difference.
+    bool exactOriginalTable = true;
+    UINT firstDifference = kEntries;
+    __try {
+        for (UINT i = 0; i < kEntries; ++i) {
+            if (clone[i] != expectedOriginal[i]) {
+                exactOriginalTable = false;
+                firstDifference = i;
+                break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        exactOriginalTable = false;
+        firstDifference = kEntries;
+    }
+    if (!exactOriginalTable) {
+        VirtualFree(clone, 0, MEM_RELEASE);
+        InterlockedExchange(&g_reobserveListProbe.state, 2);
+        Log("reobserve: attach skipped list=%p reason=table-not-exact-original firstDifference=%u",
+            (void*)list, firstDifference);
+        return;
+    }
+    // Reject a table that already points at any ScaleNG command-list wrapper;
+    // this probe must forward only to the table copied at this one-shot attach.
+    for (UINT index = 0; index < kEntries; ++index) {
+        void* target = clone[index];
+        if ((index == 9 || index == 10 || index == 12 || index == 13 ||
+             index == 26 || index == 46) && !target) {
+            VirtualFree(clone, 0, MEM_RELEASE);
+            InterlockedExchange(&g_reobserveListProbe.state, 2);
+            Log("reobserve: attach skipped list=%p reason=unsupported-forward-target slot=%u target=%p",
+                (void*)list, index, target);
+            return;
+        }
+        if (IsOurCommandListWrapper(target)) {
+            VirtualFree(clone, 0, MEM_RELEASE);
+            InterlockedExchange(&g_reobserveListProbe.state, 2);
+            Log("reobserve: attach skipped list=%p reason=ScaleNG-wrapper-in-source-table slot=%u target=%p",
+                (void*)list, index, target);
+            return;
+        }
+    }
+    ReobserveListProbe& probe = g_reobserveListProbe;
+    probe.list = list;
+    probe.observedVtbl = actual;
+    probe.clonedVtbl = clone;
+    probe.reset = (PFN_CommandListReset)actual[10];
+    probe.close = (PFN_CommandListClose)actual[9];
+    probe.drawInstanced = (PFN_DrawInstanced)actual[12];
+    probe.drawIndexedInstanced = (PFN_DrawIndexedInstanced)actual[13];
+    probe.resourceBarrier = (PFN_ResourceBarrier)actual[26];
+    probe.omSetRenderTargets = (PFN_OMSetRenderTargets)actual[46];
+    probe.epoch = 0; probe.recordingClosed = 0; probe.resetFailed = 0;
+    probe.eventSeq = 0; probe.omCount = 0; probe.drawCount = 0; probe.barrierCount = 0;
+    probe.lastRtvHandle = 0; probe.lastDsvHandle = 0; probe.lastRtvResource = 0;
+    probe.lastDsvResource = 0; probe.lastRtvGeneration = 0; probe.lastDsvGeneration = 0;
+    probe.lastSubmittedEpoch = -1;
+    probe.proxyLost = 0;
+    clone[9] = (void*)&Shim_ReobserveClose;
+    clone[10] = (void*)&Shim_ReobserveReset;
+    clone[12] = (void*)&Shim_ReobserveDraw;
+    clone[13] = (void*)&Shim_ReobserveDrawIndexed;
+    clone[26] = (void*)&Shim_ReobserveBarrier;
+    clone[46] = (void*)&Shim_ReobserveOM;
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(clone, sizeof(void*) * kEntries, PAGE_READONLY, &oldProtect)) {
+        VirtualFree(clone, 0, MEM_RELEASE);
+        probe.clonedVtbl = nullptr;
+        InterlockedExchange(&probe.state, 2);
+        Log("reobserve: attach failed list=%p reason=clone-protect", (void*)list);
+        return;
+    }
+    InterlockedExchange(&probe.state, 1); // publish immutable forwarding state before pointer CAS
+    PVOID prior = nullptr;
+    bool exchanged = false;
+    __try {
+        prior = InterlockedCompareExchangePointer((PVOID volatile*)list, clone, actual);
+        exchanged = prior == actual;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { exchanged = false; }
+    if (!exchanged) {
+        InterlockedExchange(&probe.state, 2);
+        probe.clonedVtbl = nullptr;
+        VirtualFree(clone, 0, MEM_RELEASE); // CAS did not publish this table.
+        Log("reobserve: attach abandoned list=%p expected=%p observed=%p reason=concurrent-vtable-writer",
+            (void*)list, actual, prior);
+        return;
+    }
+    Log("reobserve: ATTACHED list=%p foreign=%p probe=%p scope=one-list recording-only",
+        (void*)list, actual, clone);
+}
+
+static void ObserveReobserveListProbeSubmission(ID3D12CommandQueue* queue,
+                                               ID3D12GraphicsCommandList* list)
+{
+    ReobserveListProbe* probe = FindReobserveListProbe(list);
+    if (!probe) return;
+    void** actual = nullptr;
+    __try { actual = *(void***)list; } __except (EXCEPTION_EXECUTE_HANDLER) { actual = nullptr; }
+    if (actual != probe->clonedVtbl) {
+        if (InterlockedCompareExchange(&probe->proxyLost, 1, 0) == 0)
+            Log("reobserve: proxy-lost list=%p expected=%p actual=%p; no reattach attempted",
+                (void*)list, probe->clonedVtbl, actual);
+        return;
+    }
+    LONG64 epoch = InterlockedCompareExchange64(&probe->epoch, 0, 0);
+    if (InterlockedCompareExchange(&probe->recordingClosed, 0, 0) == 0 ||
+        InterlockedCompareExchange(&probe->resetFailed, 0, 0) != 0)
+        return;
+    LONG64 previous = InterlockedExchange64(&probe->lastSubmittedEpoch, epoch);
+    if (previous == epoch) return; // avoid mistaking repeated list replay for new recording
+    LONG64 logged = InterlockedIncrement64(&g_reobserveListProbeSubmitsLogged);
+    if (logged <= 16 || (logged % 500) == 0) {
+        Log("reobserve: submitted list=%p queue=%p epoch=%lld om=%lld draws=%lld barriers=%lld rtvHandle=%llX rtv=%llX rtvGen=%lld dsvHandle=%llX dsv=%llX dsvGen=%lld presentSerialObserved=%llu eclSerialObserved=%llu",
+            (void*)list, (void*)queue, (long long)epoch,
+            (long long)InterlockedCompareExchange64(&probe->omCount, 0, 0),
+            (long long)InterlockedCompareExchange64(&probe->drawCount, 0, 0),
+            (long long)InterlockedCompareExchange64(&probe->barrierCount, 0, 0),
+            (unsigned long long)InterlockedCompareExchange64(&probe->lastRtvHandle, 0, 0),
+            (unsigned long long)InterlockedCompareExchange64(&probe->lastRtvResource, 0, 0),
+            (long long)InterlockedCompareExchange64(&probe->lastRtvGeneration, 0, 0),
+            (unsigned long long)InterlockedCompareExchange64(&probe->lastDsvHandle, 0, 0),
+            (unsigned long long)InterlockedCompareExchange64(&probe->lastDsvResource, 0, 0),
+            (long long)InterlockedCompareExchange64(&probe->lastDsvGeneration, 0, 0),
+            (unsigned long long)InterlockedCompareExchange64(&g_presentSerial, 0, 0),
+            (unsigned long long)InterlockedCompareExchange64(&g_eclSerial, 0, 0));
+    }
 }
 
 // Diagnostic only: clone-integrity snapshot for a registered-but-mismatched list.
@@ -4482,6 +4907,10 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
         for (UINT i = 0; i < numLists; ++i) {
             ID3D12GraphicsCommandList* cl = nullptr;
             if (SUCCEEDED(lists[i]->QueryInterface(IID_PPV_ARGS(&cl))) && cl) {
+                // The diagnostic proxy is completely separate from the normal
+                // shim registry and observes only a later recording epoch.
+                // It never refreshes candidate timestamps or changes REAL gates.
+                ObserveReobserveListProbeSubmission(queue, cl);
                 // Bounded producer census: an observed closed recording has
                 // an OM-bound display-sized fmt-34 target and direct draws,
                 // and this list pointer is present in the submitted batch.
@@ -4565,8 +4994,10 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
                     void* actual = nullptr;
                     void* expectedCloned = nullptr;
                     void* expectedOriginal = nullptr;
+                    UINT registeredType = 0xFFFFFFFFu;
                     if (!preShim) {
-                        ptrRegistered = FindShimByListOnly(cl, &actual, &expectedCloned, &expectedOriginal);
+                        ptrRegistered = FindShimByListOnly(cl, &actual, &expectedCloned,
+                                                           &expectedOriginal, &registeredType);
                         if (ptrRegistered) InterlockedIncrement64(&s_eclPtrRegTotal);
                         else InterlockedIncrement64(&s_eclPtrUnregTotal);
                     }
@@ -4585,6 +5016,12 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
                             Log("hooks: ECL vtable-class list=%p class=%s actual=%p clone=%p original=%p (vc=%lld)",
                                 (void*)cl, vtblClass, actual, expectedCloned, expectedOriginal, vc);
                         }
+                    }
+                    if (!preShim && ptrRegistered && registeredType == D3D12_COMMAND_LIST_TYPE_DIRECT &&
+                        actual && actual != expectedCloned &&
+                        InterlockedCompareExchange(&g_commandListReobserveDiag, 0, 0)) {
+                        TryInstallReobserveListProbe(cl, (void**)actual,
+                            (void**)expectedCloned, (void**)expectedOriginal);
                     }
                     // Observation-only vtable-stability tracking: record this
                     // list's actual vtable to detect later changes. Reuses the
@@ -4732,17 +5169,17 @@ void Hook_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT numLists,
                                     snap.baseRegionBase, (unsigned long long)snap.baseRegionSize,
                                     (unsigned)snap.baseProtect, logged);
                                 if (snap.slotsReadable) {
-                                    Log("hooks: ECL list slots list=%p s9=%s/%ls s10=%s/%ls s12=%s/%ls s13=%s/%ls s14=%s/%ls s15=%s/%ls s16=%s/%ls s26=%s/%ls s46=%s/%ls (detail=%lld)",
+                                    Log("hooks: ECL list slots list=%p s9=%s/%ls=%p s10=%s/%ls=%p s12=%s/%ls=%p s13=%s/%ls=%p s14=%s/%ls=%p s15=%s/%ls=%p s16=%s/%ls=%p s26=%s/%ls=%p s46=%s/%ls=%p (detail=%lld)",
                                         (void*)cl,
-                                        SlotClass(snap.actualSlot[0], snap.origSlot[0], snap.clonedSlot[0]), snap.slotModBase[0],
-                                        SlotClass(snap.actualSlot[1], snap.origSlot[1], snap.clonedSlot[1]), snap.slotModBase[1],
-                                        SlotClass(snap.actualSlot[2], snap.origSlot[2], snap.clonedSlot[2]), snap.slotModBase[2],
-                                        SlotClass(snap.actualSlot[3], snap.origSlot[3], snap.clonedSlot[3]), snap.slotModBase[3],
-                                        SlotClass(snap.actualSlot[4], snap.origSlot[4], snap.clonedSlot[4]), snap.slotModBase[4],
-                                        SlotClass(snap.actualSlot[5], snap.origSlot[5], snap.clonedSlot[5]), snap.slotModBase[5],
-                                        SlotClass(snap.actualSlot[6], snap.origSlot[6], snap.clonedSlot[6]), snap.slotModBase[6],
-                                        SlotClass(snap.actualSlot[7], snap.origSlot[7], snap.clonedSlot[7]), snap.slotModBase[7],
-                                        SlotClass(snap.actualSlot[8], snap.origSlot[8], snap.clonedSlot[8]), snap.slotModBase[8],
+                                        SlotClass(snap.actualSlot[0], snap.origSlot[0], snap.clonedSlot[0]), snap.slotModBase[0], snap.actualSlot[0],
+                                        SlotClass(snap.actualSlot[1], snap.origSlot[1], snap.clonedSlot[1]), snap.slotModBase[1], snap.actualSlot[1],
+                                        SlotClass(snap.actualSlot[2], snap.origSlot[2], snap.clonedSlot[2]), snap.slotModBase[2], snap.actualSlot[2],
+                                        SlotClass(snap.actualSlot[3], snap.origSlot[3], snap.clonedSlot[3]), snap.slotModBase[3], snap.actualSlot[3],
+                                        SlotClass(snap.actualSlot[4], snap.origSlot[4], snap.clonedSlot[4]), snap.slotModBase[4], snap.actualSlot[4],
+                                        SlotClass(snap.actualSlot[5], snap.origSlot[5], snap.clonedSlot[5]), snap.slotModBase[5], snap.actualSlot[5],
+                                        SlotClass(snap.actualSlot[6], snap.origSlot[6], snap.clonedSlot[6]), snap.slotModBase[6], snap.actualSlot[6],
+                                        SlotClass(snap.actualSlot[7], snap.origSlot[7], snap.clonedSlot[7]), snap.slotModBase[7], snap.actualSlot[7],
+                                        SlotClass(snap.actualSlot[8], snap.origSlot[8], snap.clonedSlot[8]), snap.slotModBase[8], snap.actualSlot[8],
                                         logged);
                                 } else {
                                     Log("hooks: ECL list slots list=%p unreadable (detail=%lld)", (void*)cl, logged);
@@ -8504,8 +8941,11 @@ static void ShadowEvalAtPresent(IDXGISwapChain* sc, unsigned long long presentSe
     // same list, so FIFO queue order keeps engine use safe.
     // Known unknowns (logged per eval batch, NOT solved here): MV value
     // range/direction/jitter inclusion (assumed UV [0,1] prev-minus-cur,
-    // same as the legacy path's mvScale=W/H); depth convention
-    // (DepthInverted NOT set); jitter stays 0 (render is unjittered).
+    // same as the legacy path's mvScale=W/H); depth convention is configured
+    // through NGX's DepthInverted feature flag (current INI=1, consistent with
+    // the captured GTAO reversed-Z-like mapping, but ScaleNG runtime resource
+    // identity/convention is not yet proven); per-eval jitter is currently
+    // zero, while whether the evaluated color itself is jittered is unknown.
     ID3D12Resource* inMv = g_shMv;
     ID3D12Resource* inDepth = g_shDepth;
     float mvScaleX = 1.0f, mvScaleY = 1.0f;
@@ -10493,7 +10933,23 @@ static void TrackResourceBarriers(UINT numBarriers, const D3D12_RESOURCE_BARRIER
                             !IsOwnResource(res)) {
                             if (brd.Format == DXGI_FORMAT_R16G16_FLOAT) {
                                 if (res != g_mvResource && res != g_mvResourceAlt) {
-                                    if (StoreTracked(&g_mvResourceAlt, res)) {
+                                    // Option-A guard: a view-less barrier observation
+                                    // must not displace a currently eligible ALT
+                                    // candidate. Best-effort pair read (pointer and
+                                    // generation are individually atomic, not
+                                    // jointly); a generation match is not proof of
+                                    // COM liveness, valid contents, or current-frame
+                                    // data, and a dead-but-matching ALT is retained
+                                    // until a view-backed path adopts another
+                                    // candidate. Touch, ledger, counters, and stamps
+                                    // below still run when the store is skipped.
+                                    // No SetTrackedResourceGeneration here: slot
+                                    // metadata below stays store-gated, preserving
+                                    // the view-backed eligibility contract.
+                                    bool altEligible = g_mvResourceAlt &&
+                                        ResourceGenerationMatches(g_mvResourceAlt,
+                                            InterlockedCompareExchange64(&g_mvResourceAltGeneration, 0, 0));
+                                    if (!altEligible && StoreTracked(&g_mvResourceAlt, res)) {
                                         g_mvStamp = g_frameCounter;
                                         if (!g_mvFirstValidFrame) g_mvFirstValidFrame = g_frameCounter;
                                         g_mvW = (unsigned int)brd.Width; g_mvH = (unsigned int)brd.Height;
@@ -11693,8 +12149,11 @@ void HooksSetConfig(const ScaleNgConfig& config)
     g_shadowHandoff = config.shadowHandoff;
     g_abWindowPresents = config.abWindow;
     g_shadowRealInputs = config.realInputs;
-    Log("hooks: config applied (dlaa=%d legacyScale=%d; viewport arming is dlaa-gated, legacyScale retained for compat)",
-        g_dlaaMode ? 1 : 0, g_legacyScale ? 1 : 0);
+    InterlockedExchange(&g_commandListReobserveDiag,
+        config.commandListReobserveDiag ? 1 : 0);
+    Log("hooks: config applied (dlaa=%d legacyScale=%d reobserveDiag=%d; viewport arming is dlaa-gated, legacyScale retained for compat)",
+        g_dlaaMode ? 1 : 0, g_legacyScale ? 1 : 0,
+        config.commandListReobserveDiag ? 1 : 0);
 }
 
 void HooksGetDescriptorHeaps(UINT* count, ID3D12DescriptorHeap** heaps)
